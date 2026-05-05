@@ -97,12 +97,39 @@ export function useAiChat({ projectId, traceId, traceSessionId }: UseAiChatOptio
         const res = await fetch(`/api/projects/${projectId}/ai/sessions/${session.id}/messages`);
         if (res.ok) {
           const data = await res.json();
-          const loaded = (data.messages || []).map((m: any) => ({
-            id: m.id,
-            role: m.role as "user" | "assistant",
-            content: m.content,
-            timestamp: m.createTime,
-          }));
+          const loaded: AIMessage[] = (data.messages || []).map((m: any) => {
+            // Backend stores tool calls as role: "tool" + the call payload in
+            // metadata JSONB. Reconstruct the frontend tool_step bubble.
+            if (m.role === "tool" && m.metadata) {
+              const meta = m.metadata as {
+                toolCallId?: string;
+                toolName?: string;
+                args?: Record<string, unknown>;
+                result?: unknown;
+                isError?: boolean;
+              };
+              return {
+                id: m.id,
+                role: "tool_step" as const,
+                content: m.content ?? "",
+                timestamp: m.createTime,
+                toolStep: {
+                  toolCallId: meta.toolCallId ?? m.id,
+                  toolName: meta.toolName ?? m.content ?? "tool",
+                  args: meta.args ?? {},
+                  result: meta.result,
+                  isError: meta.isError,
+                  status: meta.isError ? "error" : "done",
+                },
+              };
+            }
+            return {
+              id: m.id,
+              role: m.role as "user" | "assistant",
+              content: m.content,
+              timestamp: m.createTime,
+            };
+          });
           setMessages(loaded);
         }
       } catch (err) {
