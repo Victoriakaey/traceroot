@@ -165,6 +165,19 @@ app.post("/api/v1/projects/:projectId/sessions/:sessionId/messages", async (c) =
     let assistantText = "";
     let loggedFirstUpdate = false;
 
+    // Accumulate tool calls so we can persist them as separate AIMessage rows
+    // (role: "tool") in onDone. Keyed by toolCallId so the end event can fill
+    // in the result on the matching start.
+    type ToolStepRecord = {
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      result?: unknown;
+      isError?: boolean;
+    };
+    const toolStepsByCallId = new Map<string, ToolStepRecord>();
+    const toolStepOrder: string[] = [];
+
     // Accumulate token usage across all message_end events (tool-use loops)
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -228,6 +241,27 @@ app.post("/api/v1/projects/:projectId/sessions/:sessionId/messages", async (c) =
               assistantText += delta.delta;
             }
           }
+
+          // Accumulate tool steps for DB persistence
+          if (event.type === "tool_execution_start") {
+            const e = event as any;
+            if (e.toolCallId && !toolStepsByCallId.has(e.toolCallId)) {
+              toolStepsByCallId.set(e.toolCallId, {
+                toolCallId: e.toolCallId,
+                toolName: e.toolName,
+                args: e.args ?? {},
+              });
+              toolStepOrder.push(e.toolCallId);
+            }
+          }
+          if (event.type === "tool_execution_end") {
+            const e = event as any;
+            const step = e.toolCallId ? toolStepsByCallId.get(e.toolCallId) : undefined;
+            if (step) {
+              step.result = e.result;
+              step.isError = e.isError;
+            }
+          }
         },
         onError: (error) => {
           console.error(`[Agent] ERROR:`, error.message);
@@ -238,7 +272,25 @@ app.post("/api/v1/projects/:projectId/sessions/:sessionId/messages", async (c) =
           resolve();
         },
         onDone: async () => {
-          console.log(`[Agent] Done. Assistant text length: ${assistantText.length}`);
+          console.log(
+            `[Agent] Done. Assistant text length: ${assistantText.length}, tool steps: ${toolStepOrder.length}`,
+          );
+
+          // Persist tool steps first so they sort before the assistant message
+          // by createTime. Each step becomes its own AIMessage row with
+          // role: "tool" and the call payload in metadata.
+          for (const callId of toolStepOrder) {
+            const step = toolStepsByCallId.get(callId);
+            if (!step) continue;
+            await sessionManager.appendMessage("tool", step.toolName, {
+              toolCallId: step.toolCallId,
+              toolName: step.toolName,
+              args: step.args,
+              result: step.result,
+              isError: step.isError ?? false,
+            });
+          }
+
           // Persist assistant response to DB via SessionManager
           if (assistantText) {
             // Use our pricing table if pi-ai returned 0 cost
